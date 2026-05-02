@@ -48,7 +48,7 @@ const getGlobalConfig=()=>{
 }
 const initEnvVariables=()=>{
 	require("dotenv").config();
-	const nodeCache = require(path.join(process.cwd(),"src/config/lib/nodeCache.js"))
+	const nodeCache = require(path.join(process.cwd(),"src/config/lib/nodecache.js"))
     const secrets = {
         PORT:process.env.PORT,
         COOKIE_SECRET:process.env.COOKIE_SECRET,

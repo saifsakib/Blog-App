@@ -1,6 +1,6 @@
 const express = require('express');
 const path = require("path")
-const nodeCache = require(path.join(process.cwd(),"src/config/lib/nodeCache"))
+const nodeCache = require(path.join(process.cwd(),"src/config/lib/nodecache"))
 const config = require(path.join(process.cwd(),"src/config"))
 const cookieParser = require("cookie-parser")
 module.exports=()=>{

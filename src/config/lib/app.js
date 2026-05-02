@@ -1,6 +1,6 @@
 const path = require("path");
 const express = require(path.join(process.cwd(),"src/config/lib/express"));
-const nodeCache = require(path.join(process.cwd(),"src/config/lib/nodeCache"))
+const nodeCache = require(path.join(process.cwd(),"src/config/lib/nodecache"))
 
 module.exports.start=()=>{
     const app = express()
