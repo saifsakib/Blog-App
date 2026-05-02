@@ -1,4 +1,5 @@
 const path = require("path");
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const async = require('async');
 
 const init = async()=> {
@@ -14,17 +15,6 @@ const init = async()=> {
     const PermissionService = require(path.join(process.cwd(),"src/modules/service/permissionService.model.js")); 
     
     
-    sequelize.query('CREATE DATABASE IF NOT EXISTS blogApp',(err,res)=>{
-        if (err) {
-            console.log("error=================================",err);
-        }else{
-            console.log(res)
-        }
-    })
-    
-    sequelize.sync()
-    
-     
     const userSeeder = (callback) => {
         User.findOrCreate({
             where:{

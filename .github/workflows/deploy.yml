@@ -1,0 +1,248 @@
+# =====================================================================
+# What this workflow does, in plain English:
+#   1. Build a Docker image for the backend and one for the frontend.
+#      Push both to GitHub Container Registry (ghcr.io) so the servers
+#      can download them.
+#   2. SSH into the DB server and start Postgres in a container.
+#   3. SSH into the backend server and start the backend container
+#      (then run database migrations).
+#   4. SSH into the frontend server and start the frontend container.
+#
+# Network layout (assumption):
+#   - Only ONE server has a public SSH port: the "bastion" (= frontend host).
+#   - The DB and backend servers are private. We reach them by
+#     "jumping" through the bastion (SSH ProxyJump).
+# =====================================================================
+name: Deploy
+
+# When does this workflow run?
+on:
+  push:
+    branches: [main]      # auto-deploy whenever main changes
+  workflow_dispatch:      # also let us trigger it manually from the UI
+
+# Reusable values (image names) so we don't repeat strings.
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ${{ github.repository }}/backend     # e.g. ghcr.io/owner/repo/backend
+  FRONTEND_IMAGE: ${{ github.repository }}/frontend
+
+jobs:
+  # ===================================================================
+  # JOB 1 — Build both Docker images and upload them to GHCR.
+  # ===================================================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # read the repo
+      packages: write      # push images to ghcr.io
+    outputs:
+      # Expose the short commit SHA to later jobs so they pull THIS build.
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      # Download the repo onto the runner.
+      - uses: actions/checkout@v4
+
+      # Make a short tag like "ab12cd3" from the commit SHA.
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # Enable advanced Docker build features (caching, multi-platform, etc.)
+      - uses: docker/setup-buildx-action@v3
+
+      # Log into GHCR using the auto-provided GITHUB_TOKEN.
+      # (This token is only valid for THIS workflow run — it's why we
+      # use a separate long-lived GHCR_TOKEN later on the actual servers.)
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the backend image from Dockerfile.backend and push it.
+      # Two tags so we can pull either ":<sha>" (immutable) or ":latest".
+      - name: Build & push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+
+      # Same idea for the frontend.
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+
+  # ===================================================================
+  # JOB 2 — Deploy Postgres on the DB server.
+  # The DB server is PRIVATE, so we connect through the bastion
+  # using the proxy_* fields (SSH ProxyJump).
+  # ===================================================================
+  deploy-db:
+    needs: build-and-push       # wait until images exist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Copy the compose file from the runner -> bastion -> db server.
+      - name: Copy compose file to db host
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          # Final destination = the private DB server
+          host: ${{ secrets.DB_PRIVATE_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Hop through the public bastion to get there
+          proxy_host: ${{ secrets.SSH_HOST }}
+          proxy_username: ${{ secrets.SSH_USER }}
+          proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.db.yml"
+          target: "~/blog/"
+
+      # SSH into the DB server (via bastion) and start the container.
+      - name: Run db compose
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DB_PRIVATE_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          proxy_host: ${{ secrets.SSH_HOST }}
+          proxy_username: ${{ secrets.SSH_USER }}
+          proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Commands that run ON the DB server:
+          script: |
+            cd ~/blog
+            # Write a fresh .env from GitHub Secrets each deploy.
+            cat > .env <<EOF
+            DB_NAME=${{ secrets.DB_NAME }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            EOF
+            # -d = detached (leave the container running after we disconnect)
+            docker compose -f docker-compose.db.yml --env-file .env up -d
+
+  # ===================================================================
+  # JOB 3 — Deploy the backend on the backend server.
+  # Also private → again hops through the bastion.
+  # ===================================================================
+  deploy-backend:
+    needs: [build-and-push, deploy-db]   # wait for images AND db
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy compose file to backend host
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.BACKEND_PRIVATE_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          proxy_host: ${{ secrets.SSH_HOST }}
+          proxy_username: ${{ secrets.SSH_USER }}
+          proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.backend.yml"
+          target: "~/blog/"
+
+      - name: Pull image and run backend
+        uses: appleboy/ssh-action@v1.0.3
+        # Pass the image tag from job 1 into the SSH session
+        # (otherwise the remote shell wouldn't know the value).
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+        with:
+          host: ${{ secrets.BACKEND_PRIVATE_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          proxy_host: ${{ secrets.SSH_HOST }}
+          proxy_username: ${{ secrets.SSH_USER }}
+          proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_TAG          # forward env vars into the script
+          script: |
+            cd ~/blog
+
+            # The server itself needs to log in to ghcr.io to pull the image.
+            # GHCR_TOKEN is a long-lived PAT (Personal Access Token) so the
+            # docker daemon can re-pull on reboot, not just during this run.
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io \
+              -u ${{ github.actor }} --password-stdin
+
+            # Build a .env file from secrets. The backend reads these at runtime.
+            cat > .env <<EOF
+            GITHUB_REPOSITORY=${{ github.repository }}
+            IMAGE_TAG=${IMAGE_TAG}
+            PORT=5000
+            DB_HOST=${{ secrets.DB_PRIVATE_HOST }}
+            DB_PORT=5432
+            DB_NAME=${{ secrets.DB_NAME }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            TOKEN_SECRET=${{ secrets.TOKEN_SECRET }}
+            COOKIE_SECRET=${{ secrets.COOKIE_SECRET }}
+            EOF
+
+            # Pull the new image, then start (or restart) the backend container.
+            docker compose -f docker-compose.backend.yml --env-file .env pull
+            docker compose -f docker-compose.backend.yml --env-file .env up -d
+
+            # Apply any new database migrations against the DB.
+            # -T disables a TTY (workflows don't have one).
+            docker compose -f docker-compose.backend.yml --env-file .env \
+              exec -T backend npm run db:migrate
+
+  # ===================================================================
+  # JOB 4 — Deploy the frontend on the bastion (public host).
+  # No proxy needed: we connect to it directly.
+  # ===================================================================
+  deploy-frontend:
+    needs: [build-and-push, deploy-backend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy compose file to frontend host
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}        # public bastion
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.frontend.yml"
+          target: "~/blog/"
+
+      - name: Pull image and run frontend
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_TAG
+          script: |
+            cd ~/blog
+
+            # Same pattern: log in so this host can pull from GHCR.
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io \
+              -u ${{ github.actor }} --password-stdin
+
+            # Frontend env file. BLOG_API_URL points at the backend by its
+            # PRIVATE address — the frontend container talks to the backend
+            # over the internal network, not over the public internet.
+            cat > .env <<EOF
+            GITHUB_REPOSITORY=${{ github.repository }}
+            IMAGE_TAG=${IMAGE_TAG}
+            NEXTAUTH_URL=${{ secrets.NEXTAUTH_URL }}
+            NEXTAUTH_SECRET=${{ secrets.NEXTAUTH_SECRET }}
+            BLOG_API_URL=http://${{ secrets.BACKEND_PRIVATE_HOST }}:5000
+            EOF
+
+            docker compose -f docker-compose.frontend.yml --env-file .env pull
+            docker compose -f docker-compose.frontend.yml --env-file .env up -d
