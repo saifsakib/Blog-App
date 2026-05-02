@@ -248,10 +248,17 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: IMAGE_TAG
           script: |
+            # Install Docker (with compose plugin) if it isn't there yet.
+            if ! command -v docker >/dev/null; then
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER"
+            fi
+
             cd ~/blog
 
             # Same pattern: log in so this host can pull from GHCR.
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io \
+            echo "${{ secrets.GHCR_TOKEN }}" | sudo docker login ghcr.io \
               -u ${{ github.actor }} --password-stdin
 
             # Frontend env file. BLOG_API_URL points at the backend by its
@@ -265,5 +272,6 @@ jobs:
             BLOG_API_URL=http://${{ secrets.BACKEND_PRIVATE_HOST }}:5000
             EOF
 
-            docker compose -f docker-compose.frontend.yml --env-file .env pull
-            docker compose -f docker-compose.frontend.yml --env-file .env up -d
+            # `sudo` because the docker group only takes effect on a NEW shell.
+            sudo docker compose -f docker-compose.frontend.yml --env-file .env pull
+            sudo docker compose -f docker-compose.frontend.yml --env-file .env up -d
