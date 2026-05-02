@@ -122,6 +122,14 @@ jobs:
           proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
           # Commands that run ON the DB server:
           script: |
+            # Install Docker (with compose plugin) if it isn't there yet.
+            # The official script handles every common distro.
+            if ! command -v docker >/dev/null; then
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER"
+            fi
+
             cd ~/blog
             # Write a fresh .env from GitHub Secrets each deploy.
             cat > .env <<EOF
@@ -130,7 +138,8 @@ jobs:
             DB_PASSWORD=${{ secrets.DB_PASSWORD }}
             EOF
             # -d = detached (leave the container running after we disconnect)
-            docker compose -f docker-compose.db.yml --env-file .env up -d
+            # `sudo` because the docker group only takes effect on a NEW shell.
+            sudo docker compose -f docker-compose.db.yml --env-file .env up -d
 
   # ===================================================================
   # JOB 3 — Deploy the backend on the backend server.
@@ -170,12 +179,19 @@ jobs:
           proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: IMAGE_TAG          # forward env vars into the script
           script: |
+            # Install Docker (with compose plugin) if it isn't there yet.
+            if ! command -v docker >/dev/null; then
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER"
+            fi
+
             cd ~/blog
 
             # The server itself needs to log in to ghcr.io to pull the image.
             # GHCR_TOKEN is a long-lived PAT (Personal Access Token) so the
             # docker daemon can re-pull on reboot, not just during this run.
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io \
+            echo "${{ secrets.GHCR_TOKEN }}" | sudo docker login ghcr.io \
               -u ${{ github.actor }} --password-stdin
 
             # Build a .env file from secrets. The backend reads these at runtime.
@@ -193,12 +209,13 @@ jobs:
             EOF
 
             # Pull the new image, then start (or restart) the backend container.
-            docker compose -f docker-compose.backend.yml --env-file .env pull
-            docker compose -f docker-compose.backend.yml --env-file .env up -d
+            # `sudo` because the docker group only takes effect on a NEW shell.
+            sudo docker compose -f docker-compose.backend.yml --env-file .env pull
+            sudo docker compose -f docker-compose.backend.yml --env-file .env up -d
 
             # Apply any new database migrations against the DB.
             # -T disables a TTY (workflows don't have one).
-            docker compose -f docker-compose.backend.yml --env-file .env \
+            sudo docker compose -f docker-compose.backend.yml --env-file .env \
               exec -T backend npm run db:migrate
 
   # ===================================================================
